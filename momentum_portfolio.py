@@ -22,7 +22,9 @@ enable_slippage = True
 slippage_volume_limit = 0.025
 slippage_impact = 0.05
 
-# Momentum Score Function
+'''
+Helper functions
+'''
 def momentum_score(ts: pd.Series):
     """
     Input: price time series
@@ -46,11 +48,9 @@ def momentum_score(ts: pd.Series):
     
     return score
 
-# Volatility Function
 def volatility(ts: pd.Series):
     return ts.pct_change().rolling(vola_window).std().iloc[-1]
 
-# Output progress function
 def output_progress(context):
     """
     Output some performance numbers during backtest run.
@@ -71,6 +71,9 @@ def output_progress(context):
     context.last_month = context.portfolio.portfolio_value
 
 def initialize(context):
+    """
+    Initialization and trading logic
+    """
     # Set comission and slippage
     if enable_commission:
         comm_model = PerDollar(cost=commission_pct)
@@ -94,6 +97,9 @@ def initialize(context):
     schedule_function(func=rebalance, date_rule=date_rules.month_start(), time_rule=time_rules.market_open())
 
 def rebalance(context, data):
+    """
+    Rebalance portfolio
+    """
     # Write some progress output during the backtest
     output_progress(context)
 
@@ -105,3 +111,77 @@ def rebalance(context, data):
 
     # Now let's snag the first column of the last row, i.e. latest entry
     latest_day = all_prior.iloc[-1,0]
+
+    # Split text string with tickers into a list 
+    list_of_tickers = latest_day.split(',')
+
+    # Finally, get the Zipline symbols for the tickers
+    todays_universe = [symbol(ticker) for ticker in list_of_tickers]
+
+    # Get today's universe historical data
+    hist = data.history(todays_universe, 'close', momentum_window, '1d')
+
+    # Make momentum ranking table
+    ranking_table = hist.apply(momentum_score).sort_values(ascending=False)
+
+    # Sell logic
+    # First we check if any existing position should be sold.
+    # * Sell if stock is no longer part of the index
+    # * Sell if stock has too low momentum value
+    kept_positions = list(context.portfolio.positions.keys())
+
+    for security in context.portfolio.positions:
+        if security not in todays_universe:
+            order_target_percent(security, 0.0)
+            kept_positions.remove(security)
+        elif ranking_table[security] < minimum_momentum:
+            order_target_percent(security, 0.0)
+            kept_positions.remove(security)
+
+    # Stock selection logic
+    # Check how many stocks we are keeping from last month
+    # Fill from top of the ranking list, until we reach the desired total number of portfolio holdings
+    replacement_stocks = portfolio_size - len(kept_positions)
+    
+    buy_list = ranking_table.loc[~ranking_table.index.isin(kept_positions)][:replacement_stocks]
+
+    new_portfolio = pd.concat(buy_list, ranking_table.loc[ranking_table.index.isin(kept_positions)])
+
+    # Calculate inverse volatility for stocks and make target position wheights
+    vola_table = hist[new_portfolio.index].apply(volatility)
+    inv_vola_table = 1 / vola_table
+    sum_inv_vola = np.sum(inv_vola_table)
+    vola_target_weights = inv_vola_table / sum_inv_vola
+
+    for security, rank in new_portfolio.iteritems():
+        weight = vola_target_weights[security]
+        if security in kept_positions:
+            order_target_percent(security, weight)
+        else:
+            if ranking_table[security] > minimum_momentum:
+                order_target_percent(security, weight)
+
+def analyze(context, perf):
+    perf['max'] = perf.portfolio_value.cummax()
+    perf['dd'] = (perf.portfolio_value / perf['max']) - 1
+    max_dd = perf['dd'].min()
+
+    portfolio_start_value = perf['portfolio_value'].iloc[0]
+    portfolio_end_value = perf['portfolio_value'].iloc[-1]
+
+    ann_ret = (np.power(portfolio_end_value/portfolio_start_value), (252/len(perf)))
+
+    print('Annualized Return: {:.2%} Max Drawdown: {:.2%}'.format(ann_ret, max_dd))
+
+start_date = pd.Timestamp('1997-1-1', tz='utc')
+end_date = pd.Timestamp('2018-12-31', tz='utc')
+
+perf = zipline.run_algorithm(
+    start=start_date, 
+    end=end_date, 
+    initialize=initialize, 
+    analyze=analyze, 
+    capital_base=initial_portfolio,
+    data_frequency='daily',
+    bundle='quandl')
+
