@@ -185,3 +185,5 @@ perf = zipline.run_algorithm(
     data_frequency='daily',
     bundle='quandl')
 
+print('Acabou')
+
